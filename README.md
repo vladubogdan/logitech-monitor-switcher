@@ -1,4 +1,4 @@
-# logiMonitorSwitch
+# logitech-monitor-switcher
 
 A tiny menu-bar (macOS) / system-tray (Windows) app that watches your Logitech
 keyboard/mouse and, the moment they roam to another computer, **switches your
