@@ -14,7 +14,12 @@ import (
 	"logimonitorswitch/internal/ddc"
 	"logimonitorswitch/internal/hidpp"
 	"logimonitorswitch/internal/hidtransport"
+	"logimonitorswitch/internal/powermon"
 )
+
+// wakeGrace is how long after resume we keep switching suspended, so the
+// receiver's HID links have time to re-establish without looking like a roam.
+const wakeGrace = 8 * time.Second
 
 // UI receives status updates so the tray can reflect state. All methods must be
 // safe to call from a background goroutine.
@@ -44,6 +49,12 @@ type Controller struct {
 	present     bool // is the trigger device currently on this host?
 	armed       bool // may we fire a switch on the next departure?
 
+	// Power-transition suppression. While asleep, or until suppressUntil after
+	// a wake, we never fire a switch and never re-arm — the HID link churn
+	// around sleep/wake otherwise looks exactly like the device roaming away.
+	asleep        bool
+	suppressUntil time.Time
+
 	pollInterval time.Duration
 
 	stop chan struct{}
@@ -67,7 +78,44 @@ func New(cfg *config.Config, ui UI) *Controller {
 // Start runs the supervisor loop in the background. It keeps (re)opening the
 // receiver if it goes away.
 func (c *Controller) Start() {
+	powermon.Start()
+	go c.watchPower()
 	go c.supervise()
+}
+
+// watchPower suspends switching across sleep/wake transitions. On sleep we
+// disarm; on wake we disarm and hold off for wakeGrace while the receiver's
+// links re-establish, so the reconnection churn isn't mistaken for a roam.
+func (c *Controller) watchPower() {
+	for {
+		select {
+		case <-c.stop:
+			return
+		case ev := <-powermon.Events():
+			switch ev {
+			case powermon.Sleep:
+				c.mu.Lock()
+				c.asleep = true
+				c.armed = false
+				c.mu.Unlock()
+				log.Printf("system sleeping — auto-switch suspended")
+			case powermon.Wake:
+				c.mu.Lock()
+				c.asleep = false
+				c.armed = false
+				c.present = false
+				c.suppressUntil = time.Now().Add(wakeGrace)
+				c.mu.Unlock()
+				log.Printf("system woke — auto-switch suspended for %s while links re-establish", wakeGrace)
+			}
+		}
+	}
+}
+
+// isSuppressedLocked reports whether a power transition currently forbids
+// firing/arming. Caller must hold c.mu.
+func (c *Controller) isSuppressedLocked() bool {
+	return c.asleep || time.Now().Before(c.suppressUntil)
 }
 
 // Stop signals the loop to exit and waits for it.
@@ -132,9 +180,14 @@ func (c *Controller) runOnce() error {
 	}
 
 	// Initialise presence. Critically, only arm if the device is present *now*,
-	// so launching the app while the device is already away never fires a switch.
+	// so launching the app while the device is already away never fires a
+	// switch — and never arm during a sleep/wake suppression window, so a
+	// receiver that reconnects on wake doesn't arm mid-churn.
 	present := trigger != 0 && c.pingPresent(conn, trigger)
-	c.setState(present, present)
+	c.mu.Lock()
+	c.present = present
+	c.armed = present && !c.isSuppressedLocked()
+	c.mu.Unlock()
 	c.ui.SetPresent(present)
 	if trigger != 0 {
 		c.ui.SetStatus(c.statusLine(present))
@@ -224,17 +277,16 @@ func interpret(n hidpp.Notification, trigger byte) (bool, bool) {
 
 // --- state helpers (guarded by mu) ---------------------------------------
 
-func (c *Controller) setState(present, armed bool) {
-	c.mu.Lock()
-	c.present, c.armed = present, armed
-	c.mu.Unlock()
-}
-
-// onPresent marks the device present again and re-arms for the next departure.
+// onPresent marks the device present again and re-arms for the next departure
+// (unless a sleep/wake suppression window is active, in which case arming waits
+// until the window clears).
 func (c *Controller) onPresent() {
 	c.mu.Lock()
 	was := c.present
-	c.present, c.armed = true, true
+	c.present = true
+	if !c.isSuppressedLocked() {
+		c.armed = true
+	}
 	c.mu.Unlock()
 	if !was {
 		c.ui.SetPresent(true)
@@ -256,12 +308,15 @@ func (c *Controller) onDepartStart() bool {
 	if !c.armed || !c.cfg.Enabled {
 		return false
 	}
+	if c.isSuppressedLocked() {
+		return false
+	}
 	return true
 }
 
 func (c *Controller) fireSwitch(conn *hidpp.Conn) {
 	c.mu.Lock()
-	if !c.armed || !c.cfg.Enabled {
+	if !c.armed || !c.cfg.Enabled || c.isSuppressedLocked() {
 		c.mu.Unlock()
 		return
 	}
