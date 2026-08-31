@@ -7,9 +7,14 @@ APP="logiMonitorSwitch"
 OUT="dist/${APP}.app"
 BIN="${OUT}/Contents/MacOS/${APP}"
 
-echo "Building binary..."
+STAMP="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+echo "Building binary (${STAMP})..."
 mkdir -p "${OUT}/Contents/MacOS" "${OUT}/Contents/Resources"
-CGO_ENABLED=1 go build -o "${BIN}" ./cmd/logimonitorswitch
+CGO_ENABLED=1 go build -ldflags "-X 'main.buildStamp=${STAMP}'" -o "${BIN}" ./cmd/logimonitorswitch
+# Refresh the bundle's own mtime so Finder shows the real build date, not the
+# date the .app directory was first created.
+touch "${OUT}"
 
 echo "Writing Info.plist..."
 cat > "${OUT}/Contents/Info.plist" <<PLIST

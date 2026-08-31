@@ -48,7 +48,16 @@ var hidInitOnce sync.Once
 
 func ensureInit() error {
 	var err error
-	hidInitOnce.Do(func() { err = hid.Init() })
+	hidInitOnce.Do(func() {
+		err = hid.Init()
+		// Must run AFTER hid.Init: hidapi's macOS hid_init() forces exclusive
+		// (seize) open back on "for backward compatibility", so setting it
+		// before Init would be overwritten. The option is read at open time,
+		// so setting it here (before any OpenPath) takes effect. Opening the
+		// receiver non-exclusively is what lets Logi Options+ / Flow keep
+		// working alongside us. See configureOpenMode (platform-specific).
+		configureOpenMode()
+	})
 	return err
 }
 

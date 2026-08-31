@@ -233,6 +233,35 @@ func (c *Conn) request(req []byte, timeout time.Duration) ([]byte, error) {
 
 func funcSw(fn byte) byte { return (fn << 4) | SoftwareID }
 
+// transient reports whether err is worth retrying. Since we open the receiver
+// non-exclusively (so Logi Options+ / Flow keeps working alongside us), another
+// process can be mid-transaction on the same device when we ask, making a
+// request momentarily time out or come back BUSY/UNSUPPORTED.
+func transient(err error) bool {
+	if errors.Is(err, ErrTimeout) {
+		return true
+	}
+	var he HIDPPError
+	if errors.As(err, &he) {
+		return he.Code == 0x08 || he.Code == 0x09 // BUSY / (transient) UNSUPPORTED
+	}
+	return false
+}
+
+// withRetry runs op up to n times, backing off briefly between attempts as long
+// as the failure looks like receiver contention. Non-transient errors (e.g. a
+// device that genuinely lacks a feature) return immediately.
+func (c *Conn) withRetry(n int, op func() error) error {
+	var err error
+	for i := 0; i < n; i++ {
+		if err = op(); err == nil || !transient(err) {
+			return err
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+	return err
+}
+
 // --- High-level operations ------------------------------------------------
 
 // EnableNotifications turns on wireless device-connection notifications on the
@@ -299,37 +328,43 @@ func (c *Conn) DeviceType(dev byte) (byte, error) {
 // HostInfo reports the number of host slots and the current one (0-based) for a
 // device that supports feature 0x1814 (CHANGE HOST).
 func (c *Conn) HostInfo(dev byte) (nbHosts, currentHost byte, err error) {
-	idx, err := c.FeatureIndex(dev, featureChangeHost)
-	if err != nil {
-		return 0, 0, err
-	}
-	if idx == 0 {
-		return 0, 0, fmt.Errorf("hidpp: device %d lacks feature 0x1814 (CHANGE HOST)", dev)
-	}
-	rep, err := c.request([]byte{reportShort, dev, idx, funcSw(0), 0x00, 0x00, 0x00}, 500*time.Millisecond)
-	if err != nil {
-		return 0, 0, err
-	}
-	if len(rep) < 6 {
-		return 0, 0, fmt.Errorf("hidpp: short hostInfo reply")
-	}
-	return rep[4], rep[5], nil
+	err = c.withRetry(4, func() error {
+		idx, e := c.FeatureIndex(dev, featureChangeHost)
+		if e != nil {
+			return e
+		}
+		if idx == 0 {
+			return fmt.Errorf("hidpp: device %d lacks feature 0x1814 (CHANGE HOST)", dev)
+		}
+		rep, e := c.request([]byte{reportShort, dev, idx, funcSw(0), 0x00, 0x00, 0x00}, 500*time.Millisecond)
+		if e != nil {
+			return e
+		}
+		if len(rep) < 6 {
+			return fmt.Errorf("hidpp: short hostInfo reply")
+		}
+		nbHosts, currentHost = rep[4], rep[5]
+		return nil
+	})
+	return
 }
 
 // SetHost commands device dev to switch to host slot hostIndex (0-based). The
 // device usually drops off this receiver immediately, so a timeout on the reply
 // is treated as success.
 func (c *Conn) SetHost(dev, hostIndex byte) error {
-	idx, err := c.FeatureIndex(dev, featureChangeHost)
-	if err != nil {
+	return c.withRetry(4, func() error {
+		idx, err := c.FeatureIndex(dev, featureChangeHost)
+		if err != nil {
+			return err
+		}
+		if idx == 0 {
+			return fmt.Errorf("hidpp: device %d lacks feature 0x1814 (CHANGE HOST)", dev)
+		}
+		_, err = c.request([]byte{reportShort, dev, idx, funcSw(1), hostIndex, 0x00, 0x00}, 600*time.Millisecond)
+		if err != nil && errors.Is(err, ErrTimeout) {
+			return nil // expected: the device left before replying
+		}
 		return err
-	}
-	if idx == 0 {
-		return fmt.Errorf("hidpp: device %d lacks feature 0x1814 (CHANGE HOST)", dev)
-	}
-	_, err = c.request([]byte{reportShort, dev, idx, funcSw(1), hostIndex, 0x00, 0x00}, 600*time.Millisecond)
-	if err != nil && (errors.Is(err, ErrTimeout)) {
-		return nil // expected: the device left before replying
-	}
-	return err
+	})
 }

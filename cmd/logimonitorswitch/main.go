@@ -15,6 +15,10 @@ import (
 	"logimonitorswitch/internal/tray"
 )
 
+// buildStamp is set at link time (-ldflags "-X main.buildStamp=...") so the log
+// unambiguously identifies which binary is running.
+var buildStamp = "dev"
+
 func main() {
 	cfgPath := flag.String("config", "", "path to config file (default: OS user config dir)")
 	flag.Parse()
@@ -42,7 +46,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config %s: %v", path, err)
 	}
-	log.Printf("started; config: %s", cfg.Path())
+	log.Printf("started (build %s); config: %s", buildStamp, cfg.Path())
 
 	tray.Run(cfg)
 }
