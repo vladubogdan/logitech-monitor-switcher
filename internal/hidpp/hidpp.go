@@ -282,7 +282,20 @@ func (c *Conn) Enumerate() error {
 // Ping reports whether device dev is currently connected, and its HID++
 // protocol version (major.minor) when it is.
 func (c *Conn) Ping(dev byte) (connected bool, major, minor byte) {
-	rep, err := c.request([]byte{reportShort, dev, featureRoot, funcSw(1), 0x00, 0x00, 0xAA}, 500*time.Millisecond)
+	return c.pingTimeout(dev, 500*time.Millisecond)
+}
+
+// PingWithTimeout reports whether dev is connected, waiting at most timeout for
+// the reply. A present device answers within a few milliseconds, so a short
+// timeout makes "is it gone?" checks fast: an absent device costs only timeout
+// instead of the default half second.
+func (c *Conn) PingWithTimeout(dev byte, timeout time.Duration) bool {
+	ok, _, _ := c.pingTimeout(dev, timeout)
+	return ok
+}
+
+func (c *Conn) pingTimeout(dev byte, timeout time.Duration) (connected bool, major, minor byte) {
+	rep, err := c.request([]byte{reportShort, dev, featureRoot, funcSw(1), 0x00, 0x00, 0xAA}, timeout)
 	if err != nil {
 		return false, 0, 0
 	}
@@ -361,7 +374,10 @@ func (c *Conn) SetHost(dev, hostIndex byte) error {
 		if idx == 0 {
 			return fmt.Errorf("hidpp: device %d lacks feature 0x1814 (CHANGE HOST)", dev)
 		}
-		_, err = c.request([]byte{reportShort, dev, idx, funcSw(1), hostIndex, 0x00, 0x00}, 600*time.Millisecond)
+		// The write itself triggers the host change; the reply is only an ack the
+		// departing device usually never sends. So we wait only briefly for it and
+		// treat a timeout as success — no need to hold up the switch for 600ms.
+		_, err = c.request([]byte{reportShort, dev, idx, funcSw(1), hostIndex, 0x00, 0x00}, 300*time.Millisecond)
 		if err != nil && errors.Is(err, ErrTimeout) {
 			return nil // expected: the device left before replying
 		}

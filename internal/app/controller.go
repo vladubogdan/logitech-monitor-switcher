@@ -196,14 +196,21 @@ func (c *Controller) runOnce() error {
 	poll := time.NewTicker(c.pollInterval)
 	defer poll.Stop()
 
-	// Debounce timer for a pending departure.
+	// Debounce timer for a pending departure. The bool carried on pendingC records
+	// whether the departure came from an authoritative disconnect notification
+	// (true) or from the less-reliable poll fallback (false); it selects how hard
+	// we re-confirm absence before firing.
 	var pending *time.Timer
-	pendingC := make(chan struct{}, 1)
+	pendingC := make(chan bool, 1)
 	cancelPending := func() {
 		if pending != nil {
 			pending.Stop()
 			pending = nil
 		}
+	}
+	scheduleDepart := func(viaNote bool) {
+		cancelPending()
+		pending = time.AfterFunc(c.debounce(), func() { pendingC <- viaNote })
 	}
 
 	notes := conn.Notifications()
@@ -225,8 +232,7 @@ func (c *Controller) runOnce() error {
 					cancelPending()
 					c.onPresent()
 				} else if c.onDepartStart() {
-					cancelPending()
-					pending = time.AfterFunc(c.debounce(), func() { pendingC <- struct{}{} })
+					scheduleDepart(true) // authoritative
 				}
 			}
 
@@ -240,16 +246,25 @@ func (c *Controller) runOnce() error {
 				cancelPending()
 				c.onPresent()
 			} else if c.onDepartStart() {
-				cancelPending()
-				pending = time.AfterFunc(c.debounce(), func() { pendingC <- struct{}{} })
+				scheduleDepart(false) // poll-based; confirm harder
 			}
 
-		case <-pendingC:
-			// Debounce elapsed; confirm still absent before acting. Require
-			// several ping attempts to all fail, so a single congested reply
-			// (common while a device streams input) can't cause a false switch.
+		case viaNote := <-pendingC:
+			// Debounce elapsed; confirm still absent before acting. A disconnect
+			// notification is authoritative, so one quick ping is enough. A
+			// poll-detected departure is less reliable (a device streaming input
+			// can delay its own ping reply), so re-check harder to avoid a false
+			// switch while the device is really still here.
 			trig := c.triggerDevice()
-			if trig == 0 || c.pingPresentConfirm(conn, trig) {
+			stillHere := trig == 0
+			if trig != 0 {
+				if viaNote {
+					stillHere = c.pingPresentQuick(conn, trig)
+				} else {
+					stillHere = c.pingPresentConfirm(conn, trig)
+				}
+			}
+			if stillHere {
 				c.onPresent()
 				continue
 			}
@@ -331,19 +346,31 @@ func (c *Controller) fireSwitch(conn *hidpp.Conn) {
 	c.ui.SetPresent(false)
 	log.Printf("%s roamed away — performing switch", c.cfg.Trigger)
 
+	// Push the mouse and switch the monitor concurrently: they hit different
+	// hardware (the receiver vs. the display's DDC channel) and neither depends
+	// on the other, so running them in parallel shaves the mouse-push time off
+	// the user-visible switch latency.
+	//
 	// 1) Push the mouse to follow the keyboard (number-key mode). Harmless if
 	//    the mouse already left (Flow mode).
+	var pushWG sync.WaitGroup
 	if pushMouse && mouseDev != 0 {
-		if err := conn.SetHost(mouseDev, mouseHost); err != nil {
-			log.Printf("push mouse to host %d: %v", mouseHost, err)
-		} else {
-			log.Printf("pushed mouse to host %d", mouseHost)
-		}
+		pushWG.Add(1)
+		go func() {
+			defer pushWG.Done()
+			if err := conn.SetHost(mouseDev, mouseHost); err != nil {
+				log.Printf("push mouse to host %d: %v", mouseHost, err)
+			} else {
+				log.Printf("pushed mouse to host %d", mouseHost)
+			}
+		}()
 	}
 
 	// 2) Switch the monitor input. This must happen while we are still the
 	//    active source — which we are, at the instant of departure.
-	if err := ddc.SetInputByMatch(match, input); err != nil {
+	err := ddc.SetInputByMatch(match, input)
+	pushWG.Wait()
+	if err != nil {
 		log.Printf("monitor switch failed: %v", err)
 		c.ui.SetStatus("Monitor switch FAILED: " + err.Error())
 		c.ui.Notify("logiMonitorSwitch", "Monitor switch failed: "+err.Error())
@@ -472,14 +499,23 @@ func (c *Controller) pingPresent(conn *hidpp.Conn, dev byte) bool {
 	return ok
 }
 
+// pingPresentQuick does a single short-timeout ping. Used to confirm an
+// authoritative disconnect notification: a device that is really still here
+// answers within a few ms, and one that has roamed away costs only the short
+// timeout instead of a full confirm sweep.
+func (c *Controller) pingPresentQuick(conn *hidpp.Conn, dev byte) bool {
+	return conn.PingWithTimeout(dev, 150*time.Millisecond)
+}
+
 // pingPresentConfirm returns true if any of a few ping attempts succeeds. Used
-// before firing a switch to reject transient reply congestion.
+// on the poll fallback path (no authoritative notification) to reject transient
+// reply congestion before firing a switch.
 func (c *Controller) pingPresentConfirm(conn *hidpp.Conn, dev byte) bool {
 	for i := 0; i < 3; i++ {
-		if ok, _, _ := conn.Ping(dev); ok {
+		if conn.PingWithTimeout(dev, 250*time.Millisecond) {
 			return true
 		}
-		time.Sleep(120 * time.Millisecond)
+		time.Sleep(80 * time.Millisecond)
 	}
 	return false
 }
@@ -489,7 +525,7 @@ func (c *Controller) debounce() time.Duration {
 	d := c.cfg.DebounceMs
 	c.mu.Unlock()
 	if d <= 0 {
-		d = 400
+		d = 250
 	}
 	return time.Duration(d) * time.Millisecond
 }

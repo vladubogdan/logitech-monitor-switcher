@@ -55,7 +55,7 @@ type Config struct {
 	MouseTargetHost int `json:"mouseTargetHost"`
 
 	// DebounceMs is how long a roam-away must persist before we act, to reject
-	// momentary link blips. Default 400ms.
+	// momentary link blips. Default 250ms.
 	DebounceMs int `json:"debounceMs"`
 
 	// path is where this config was loaded from / will be saved to.
@@ -72,7 +72,7 @@ func Default() *Config {
 		MonitorTargetInput: 0x0F, // DisplayPort-1; user should confirm
 		PushMouse:          true,
 		MouseTargetHost:    1, // host 2 on the device
-		DebounceMs:         400,
+		DebounceMs:         250,
 	}
 }
 
@@ -102,7 +102,7 @@ func Load(path string) (*Config, error) {
 	}
 	c.path = path
 	if c.DebounceMs <= 0 {
-		c.DebounceMs = 400
+		c.DebounceMs = 250
 	}
 	if c.Trigger == "" {
 		c.Trigger = TriggerKeyboard
