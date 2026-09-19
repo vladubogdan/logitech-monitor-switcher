@@ -114,8 +114,13 @@ func (c *Controller) watchPower() {
 
 // isSuppressedLocked reports whether a power transition currently forbids
 // firing/arming. Caller must hold c.mu.
+//
+// It consults powermon.Suppressed directly (not just c.asleep/c.suppressUntil,
+// which are set by the watchPower goroutine) so the decision cannot be out-raced
+// by that goroutine being scheduled late on wake — the exact window in which the
+// reconnect churn used to slip through and fire a bogus switch.
 func (c *Controller) isSuppressedLocked() bool {
-	return c.asleep || time.Now().Before(c.suppressUntil)
+	return c.asleep || time.Now().Before(c.suppressUntil) || powermon.Suppressed(wakeGrace)
 }
 
 // Stop signals the loop to exit and waits for it.
@@ -214,6 +219,7 @@ func (c *Controller) runOnce() error {
 	}
 
 	notes := conn.Notifications()
+	lastPoll := present // for logging poll-detected presence transitions
 	for {
 		select {
 		case <-c.stop:
@@ -224,14 +230,20 @@ func (c *Controller) runOnce() error {
 				return fmt.Errorf("receiver disconnected")
 			}
 			trig := c.triggerDevice()
+			// Log every notification so a Windows log shows whether the receiver
+			// is delivering device-connection events to us at all (the macOS vs.
+			// Windows difference is in how these reports are read).
+			log.Printf("hid notification: dev=%d subid=0x%02X params=% X (trigger=%d)", n.Device, n.SubID, n.Params, trig)
 			if trig == 0 {
 				continue
 			}
 			if chg, nowPresent := interpret(n, trig); chg {
+				log.Printf("trigger %s (dev %d) presence via notification → present=%v", c.cfg.Trigger, trig, nowPresent)
 				if nowPresent {
 					cancelPending()
 					c.onPresent()
 				} else if c.onDepartStart() {
+					log.Printf("departure detected via notification — debouncing %s", c.debounce())
 					scheduleDepart(true) // authoritative
 				}
 			}
@@ -242,10 +254,15 @@ func (c *Controller) runOnce() error {
 				continue
 			}
 			nowPresent := c.pingPresent(conn, trig)
+			if nowPresent != lastPoll {
+				log.Printf("poll: %s (dev %d) present=%v", c.cfg.Trigger, trig, nowPresent)
+				lastPoll = nowPresent
+			}
 			if nowPresent {
 				cancelPending()
 				c.onPresent()
 			} else if c.onDepartStart() {
+				log.Printf("departure detected via poll — debouncing %s", c.debounce())
 				scheduleDepart(false) // poll-based; confirm harder
 			}
 
@@ -265,9 +282,11 @@ func (c *Controller) runOnce() error {
 				}
 			}
 			if stillHere {
+				log.Printf("debounce elapsed but %s still present — not switching", c.cfg.Trigger)
 				c.onPresent()
 				continue
 			}
+			log.Printf("debounce elapsed and %s confirmed absent — firing switch", c.cfg.Trigger)
 			c.fireSwitch(conn)
 		}
 	}
@@ -324,6 +343,7 @@ func (c *Controller) onDepartStart() bool {
 		return false
 	}
 	if c.isSuppressedLocked() {
+		log.Printf("departure ignored: power-transition suppression active (asleep or just woke)")
 		return false
 	}
 	return true
@@ -331,8 +351,9 @@ func (c *Controller) onDepartStart() bool {
 
 func (c *Controller) fireSwitch(conn *hidpp.Conn) {
 	c.mu.Lock()
-	if !c.armed || !c.cfg.Enabled || c.isSuppressedLocked() {
+	if armed, enabled, suppressed := c.armed, c.cfg.Enabled, c.isSuppressedLocked(); !armed || !enabled || suppressed {
 		c.mu.Unlock()
+		log.Printf("switch aborted at fire time (armed=%v enabled=%v suppressed=%v)", armed, enabled, suppressed)
 		return
 	}
 	c.armed = false // don't refire until the device returns

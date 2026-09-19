@@ -10,6 +10,11 @@
 // events to disarm around the transition.
 package powermon
 
+import (
+	"sync"
+	"time"
+)
+
 // Event is a system power transition.
 type Event int
 
@@ -32,9 +37,44 @@ var events = make(chan Event, 8)
 // Events returns the channel of power transitions. It never closes.
 func Events() <-chan Event { return events }
 
-// emit posts an event without blocking (drops if the buffer is full, which
-// only happens if nobody is draining — in which case the event is moot).
+// Synchronous power state, written inside emit (i.e. directly from the OS power
+// callback's thread) so any goroutine can consult it without waiting for the
+// Events() channel to be drained. This is what closes the wake-race: the HID
+// reconnect churn that arrives on wake is handled on a different goroutine than
+// the one draining Events(), so a channel-only signal can be applied too late
+// to stop a bogus switch. Reading this state directly at decide-time cannot be
+// out-raced by scheduler starvation.
+var (
+	stateMu  sync.Mutex
+	asleep   bool
+	lastWake time.Time
+)
+
+// Suppressed reports whether switching should currently be held off because the
+// system is asleep or woke within grace. asleep stays true from the sleep
+// callback until the wake callback clears it, so there is no unsuppressed gap
+// during the reconnect churn.
+func Suppressed(grace time.Duration) bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if asleep {
+		return true
+	}
+	return !lastWake.IsZero() && time.Since(lastWake) < grace
+}
+
+// emit records the transition synchronously, then posts it without blocking
+// (dropping only if the buffer is full, which means nobody is draining — moot).
 func emit(e Event) {
+	stateMu.Lock()
+	if e == Sleep {
+		asleep = true
+	} else {
+		asleep = false
+		lastWake = time.Now()
+	}
+	stateMu.Unlock()
+
 	select {
 	case events <- e:
 	default:
